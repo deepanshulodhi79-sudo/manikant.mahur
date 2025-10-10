@@ -10,8 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // 🔑 Hardcoded login
-const HARD_USERNAME = "Manikant Mahur";
-const HARD_PASSWORD = "Mahurji10@#";
+const HARD_USERNAME = "Yatendra Rajput";
+const HARD_PASSWORD = "Yattu@882";
 
 // Middleware
 app.use(bodyParser.urlencoded({ extended: true }));
