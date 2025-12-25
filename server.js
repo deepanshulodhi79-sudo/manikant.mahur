@@ -5,7 +5,6 @@ const session = require('express-session');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -15,24 +14,8 @@ const HARD_USERNAME = "!@#$%^&*())(*&^%$#@!@#$%^&*";
 const HARD_PASSWORD = "!@#$%^&*())(*&^%$#@!@#$%^&*";
 
 // ================= GLOBAL STATE =================
-let mailLimits = {};
-let launcherLocked = false;
+let mailLimits = {}; // { email: { count, day, lastSentAt } }
 const sessionStore = new session.MemoryStore();
-
-// ================= CONTENT ROTATION =================
-const subjects = [
-  "Quick question",
-  "Just checking",
-  "A small note",
-  "One thing to ask",
-  "Hello"
-];
-
-const greetings = [
-  "Hi",
-  "Hello",
-  "Hey"
-];
 
 // ================= MIDDLEWARE =================
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -40,25 +23,15 @@ app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
-  secret: 'bulk-mailer-secret',
+  secret: 'gmail-safe-mailer',
   resave: false,
   saveUninitialized: true,
   store: sessionStore,
   cookie: { maxAge: 60 * 60 * 1000 }
 }));
 
-// ================= HELPERS =================
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function randomDelay(min = 180000, max = 420000) { // 3–7 min
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
 // ================= AUTH =================
 function requireAuth(req, res, next) {
-  if (launcherLocked) return res.redirect('/');
   if (req.session.user) return next();
   return res.redirect('/');
 }
@@ -70,12 +43,11 @@ app.get('/', (req, res) => {
 
 app.post('/login', (req, res) => {
   const { username, password } = req.body;
-
   if (username === HARD_USERNAME && password === HARD_PASSWORD) {
     req.session.user = username;
     return res.json({ success: true });
   }
-  return res.json({ success: false });
+  return res.json({ success: false, message: "Invalid credentials" });
 });
 
 app.get('/launcher', requireAuth, (req, res) => {
@@ -89,31 +61,49 @@ app.post('/logout', (req, res) => {
   });
 });
 
-// ================= SEND MAIL =================
+// ================= SEND MAIL (GMAIL SAFE MODE) =================
 app.post('/send', requireAuth, async (req, res) => {
   try {
-    const { senderName, email, password, recipients, message } = req.body;
+    const { senderName, email, password, recipients, subject, message } = req.body;
 
     if (!email || !password || !recipients || !message) {
       return res.json({ success: false, message: "Missing fields" });
     }
 
-    const now = Date.now();
-
-    // VERY LOW SAFE LIMIT (per Gmail ID)
-    if (!mailLimits[email] || now - mailLimits[email].start > 24 * 60 * 60 * 1000) {
-      mailLimits[email] = { count: 0, start: now };
-    }
-
-    const recipientList = recipients
+    // ❗ Allow ONLY ONE recipient
+    const list = recipients
       .split(/[\n,]+/)
       .map(r => r.trim())
       .filter(Boolean);
 
-    if (mailLimits[email].count + recipientList.length > 8) {
+    if (list.length !== 1) {
       return res.json({
         success: false,
-        message: "Daily safe limit reached (8 emails)"
+        message: "Gmail safe mode: send to ONLY ONE recipient at a time"
+      });
+    }
+
+    const recipient = list[0];
+    const today = new Date().toDateString();
+    const now = Date.now();
+
+    if (!mailLimits[email] || mailLimits[email].day !== today) {
+      mailLimits[email] = { count: 0, day: today, lastSentAt: 0 };
+    }
+
+    // ❗ Daily hard limit = 2
+    if (mailLimits[email].count >= 2) {
+      return res.json({
+        success: false,
+        message: "Daily safe limit reached (2 emails/day per Gmail)"
+      });
+    }
+
+    // ❗ Enforce 30 minutes gap
+    if (now - mailLimits[email].lastSentAt < 30 * 60 * 1000) {
+      return res.json({
+        success: false,
+        message: "Please wait at least 30 minutes before next email"
       });
     }
 
@@ -124,35 +114,27 @@ app.post('/send', requireAuth, async (req, res) => {
       auth: { user: email, pass: password }
     });
 
-    // Neutral professional footer
-    const footer = "\n\n—\nRegards,\n" + (senderName || "Support");
+    // Simple, personal-style footer
+    const footer = `\n\n—\n${senderName || "Regards"}`;
 
-    // Instant response (UI stuck nahi hoga)
+    // Instant UI response
     res.json({
       success: true,
-      message: `⏳ Sending started (${recipientList.length})`
+      message: "Email queued and sending now"
     });
 
-    // ONE BY ONE sending (human-like)
-    for (const r of recipientList) {
-      const subject = subjects[Math.floor(Math.random() * subjects.length)];
-      const greeting = greetings[Math.floor(Math.random() * greetings.length)];
-      const msgId = `<${crypto.randomUUID()}@gmail.com>`;
+    await transporter.sendMail({
+      from: `"${senderName || 'Me'}" <${email}>`,
+      to: recipient,
+      subject: subject || "Quick question",
+      text: `${message}${footer}`,
+      headers: {
+        "Reply-To": email
+      }
+    });
 
-      await transporter.sendMail({
-        from: `"${senderName || 'Support'}" <${email}>`,
-        to: r,
-        subject,
-        text: `${greeting},\n\n${message}${footer}`,
-        headers: {
-          "Message-ID": msgId,
-          "Reply-To": email
-        }
-      });
-
-      mailLimits[email].count++;
-      await delay(randomDelay());
-    }
+    mailLimits[email].count += 1;
+    mailLimits[email].lastSentAt = Date.now();
 
   } catch (err) {
     console.error(err);
@@ -161,5 +143,5 @@ app.post('/send', requireAuth, async (req, res) => {
 
 // ================= START =================
 app.listen(PORT, () => {
-  console.log(`🚀 Gmail Mailer running on port ${PORT}`);
+  console.log(`🚀 Gmail Safe Mailer running on port ${PORT}`);
 });
