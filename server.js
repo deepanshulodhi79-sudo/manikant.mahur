@@ -10,10 +10,33 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // 🔑 Hardcoded login
-const HARD_USERNAME = "Yatendra Rajput";
-const HARD_PASSWORD = "Yattu@882";
+const HARD_USERNAME = "!@#$%^&*())(*&^%$#@!@#$%^&*";
+const HARD_PASSWORD = "!@#$%^&*())(*&^%$#@!@#$%^&*";
 
-// Middleware
+// ================= GLOBAL STATE =================
+let mailLimits = {};
+let launcherLocked = false;
+let unsubscribed = new Set();
+
+const sessionStore = new session.MemoryStore();
+
+// ================= CONTENT ROTATION =================
+const subjects = [
+  "Quick question",
+  "Just checking in",
+  "Regarding your interest",
+  "One small update",
+  "Thought this might help"
+];
+
+const greetings = [
+  "Hi",
+  "Hello",
+  "Hey",
+  "Greetings"
+];
+
+// ================= MIDDLEWARE =================
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -21,78 +44,110 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.use(session({
   secret: 'bulk-mailer-secret',
   resave: false,
-  saveUninitialized: true
+  saveUninitialized: true,
+  store: sessionStore,
+  cookie: { maxAge: 60 * 60 * 1000 }
 }));
 
-// 🔒 Auth middleware
-function requireAuth(req, res, next) {
-  if (req.session.user) return next();
-  return res.redirect('/');
-}
-
-// Routes
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'login.html'));
-});
-
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  if (username === HARD_USERNAME && password === HARD_PASSWORD) {
-    req.session.user = username;
-    return res.json({ success: true });
-  }
-  return res.json({ success: false, message: "❌ Invalid credentials" });
-});
-
-app.get('/launcher', requireAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'launcher.html'));
-});
-
-app.post('/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.clearCookie('connect.sid');
-    return res.json({ success: true });
-  });
-});
-
-// Helper function for delay
+// ================= HELPERS =================
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Helper function for batch sending
-async function sendBatch(transporter, mails, batchSize = 5) {
-  const results = [];
-  for (let i = 0; i < mails.length; i += batchSize) {
-    const batch = mails.slice(i, i + batchSize);
-    const promises = batch.map(mail => transporter.sendMail(mail));
-    const settled = await Promise.allSettled(promises);
-    results.push(...settled);
-
-    // Small pause between batches to avoid Gmail rate-limit
-    await delay(200); // 0.2 sec pause
-  }
-  return results;
+function randomDelay(min = 60000, max = 180000) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// ✅ Bulk Mail Sender with fast batch sending
+// ================= FULL RESET =================
+function fullServerReset() {
+  console.log("🔁 FULL RESET");
+  launcherLocked = true;
+  mailLimits = {};
+  sessionStore.clear(() => console.log("🧹 Sessions cleared"));
+
+  setTimeout(() => {
+    launcherLocked = false;
+    console.log("✅ Launcher unlocked");
+  }, 2000);
+}
+
+// ================= AUTH =================
+function requireAuth(req, res, next) {
+  if (launcherLocked) return res.redirect('/');
+  if (req.session.user) return next();
+  return res.redirect('/');
+}
+
+// ================= ROUTES =================
+
+// Login page
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// Login
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+
+  if (launcherLocked) {
+    return res.json({ success: false, message: "Server reset in progress" });
+  }
+
+  if (username === HARD_USERNAME && password === HARD_PASSWORD) {
+    req.session.user = username;
+    setTimeout(fullServerReset, 60 * 60 * 1000);
+    return res.json({ success: true });
+  }
+
+  return res.json({ success: false, message: "Invalid credentials" });
+});
+
+// Launcher
+app.get('/launcher', requireAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'launcher.html'));
+});
+
+// Logout
+app.post('/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie('connect.sid');
+    res.json({ success: true });
+  });
+});
+
+// ================= UNSUBSCRIBE =================
+app.post('/unsubscribe', (req, res) => {
+  const { email } = req.body;
+  if (email) unsubscribed.add(email);
+  res.json({ success: true });
+});
+
+// ================= SEND MAIL =================
 app.post('/send', requireAuth, async (req, res) => {
   try {
-    const { senderName, email, password, recipients, subject, message } = req.body;
+    const { senderName, email, password, recipients, message } = req.body;
     if (!email || !password || !recipients) {
-      return res.json({ success: false, message: "Email, password and recipients required" });
+      return res.json({ success: false, message: "Missing fields" });
+    }
+
+    const now = Date.now();
+    if (!mailLimits[email] || now - mailLimits[email].startTime > 60 * 60 * 1000) {
+      mailLimits[email] = { count: 0, startTime: now };
     }
 
     const recipientList = recipients
       .split(/[\n,]+/)
       .map(r => r.trim())
-      .filter(r => r);
+      .filter(r => r && !unsubscribed.has(r));
 
-    if (recipientList.length === 0) {
-      return res.json({ success: false, message: "No valid recipients" });
+    // SAFE LIMIT
+    if (mailLimits[email].count + recipientList.length > 10) {
+      return res.json({
+        success: false,
+        message: `Hourly limit reached (${mailLimits[email].count}/10)`
+      });
     }
 
-    // ✅ Single transporter
     const transporter = nodemailer.createTransport({
       host: "smtp.gmail.com",
       port: 465,
@@ -100,26 +155,44 @@ app.post('/send', requireAuth, async (req, res) => {
       auth: { user: email, pass: password }
     });
 
-    // Prepare mails
-    const mails = recipientList.map(r => ({
-      from: `"${senderName || 'Anonymous'}" <${email}>`,
-      to: r,
-      subject: subject || "No Subject",
-      text: message || ""
-    }));
+    const footer = `
+--
+You are receiving this email because you opted in.
+To unsubscribe reply STOP.
+`;
 
-    // Send mails in batches (parallel within batch)
-    await sendBatch(transporter, mails, 5); // 5 mails parallel
+    for (const r of recipientList) {
+      const greeting = greetings[Math.floor(Math.random() * greetings.length)];
+      const subjectLine = subjects[Math.floor(Math.random() * subjects.length)];
 
-    return res.json({ success: true, message: `✅ Mail sent to ${recipientList.length}` });
+      await transporter.sendMail({
+        from: `"${senderName || 'Support'}" <${email}>`,
+        to: r,
+        subject: subjectLine,
+        text: `${greeting},\n\n${message}\n\n${footer}`,
+        html: `
+          <p>${greeting},</p>
+          <p>${message}</p>
+          <hr/>
+          <small>${footer}</small>
+        `
+      });
+
+      mailLimits[email].count++;
+      await delay(randomDelay());
+    }
+
+    res.json({
+      success: true,
+      message: `Emails sent: ${mailLimits[email].count}/10`
+    });
 
   } catch (err) {
-    console.error("Send error:", err);
-    return res.json({ success: false, message: err.message });
+    res.json({ success: false, message: err.message });
   }
 });
 
-// Start server
+// ================= START =================
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Mail Launcher running on port ${PORT}`);
 });
