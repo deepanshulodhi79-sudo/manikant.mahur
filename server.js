@@ -14,7 +14,14 @@ const HARD_USERNAME = "!@#$%^&*())(*&^%$#@!@#$%^&*";
 const HARD_PASSWORD = "!@#$%^&*())(*&^%$#@!@#$%^&*";
 
 // ================= GLOBAL STATE =================
-let mailLimits = {}; // { email: { count, day, lastSentAt } }
+
+// Per-sender hourly mail limit
+let mailLimits = {};
+
+// Global launcher lock
+let launcherLocked = false;
+
+// Session store
 const sessionStore = new session.MemoryStore();
 
 // ================= MIDDLEWARE =================
@@ -22,88 +29,133 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Session (1 hour life)
 app.use(session({
-  secret: 'gmail-safe-mailer',
+  secret: 'bulk-mailer-secret',
   resave: false,
   saveUninitialized: true,
   store: sessionStore,
-  cookie: { maxAge: 60 * 60 * 1000 }
+  cookie: {
+    maxAge: 60 * 60 * 1000 // 1 hour
+  }
 }));
 
+// ================= FULL RESET =================
+
+function fullServerReset() {
+  console.log("🔁 FULL LAUNCHER RESET");
+
+  launcherLocked = true;
+  mailLimits = {};
+
+  sessionStore.clear(() => {
+    console.log("🧹 All sessions cleared");
+  });
+
+  setTimeout(() => {
+    launcherLocked = false;
+    console.log("✅ Launcher unlocked for fresh login");
+  }, 2000);
+}
+
 // ================= AUTH =================
+
 function requireAuth(req, res, next) {
+  if (launcherLocked) return res.redirect('/');
   if (req.session.user) return next();
   return res.redirect('/');
 }
 
 // ================= ROUTES =================
+
+// Login page
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
+// Login
 app.post('/login', (req, res) => {
   const { username, password } = req.body;
+
+  if (launcherLocked) {
+    return res.json({
+      success: false,
+      message: "⛔ Launcher reset ho raha hai, thodi der baad login karo"
+    });
+  }
+
   if (username === HARD_USERNAME && password === HARD_PASSWORD) {
     req.session.user = username;
+
+    // ⏱️ Full reset after 1 hour
+    setTimeout(fullServerReset, 60 * 60 * 1000);
+
     return res.json({ success: true });
   }
-  return res.json({ success: false, message: "Invalid credentials" });
+
+  return res.json({ success: false, message: "❌ Invalid credentials" });
 });
 
+// Launcher page
 app.get('/launcher', requireAuth, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'launcher.html'));
 });
 
+// ================= LOGOUT =================
 app.post('/logout', (req, res) => {
   req.session.destroy(() => {
     res.clearCookie('connect.sid');
-    res.json({ success: true });
+    return res.json({
+      success: true,
+      message: "✅ Logged out successfully"
+    });
   });
 });
 
-// ================= SEND MAIL (GMAIL SAFE MODE) =================
+// ================= HELPERS =================
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sendBatch(transporter, mails, batchSize = 5) {
+  for (let i = 0; i < mails.length; i += batchSize) {
+    await Promise.allSettled(
+      mails.slice(i, i + batchSize).map(m => transporter.sendMail(m))
+    );
+    await delay(300);
+  }
+}
+
+// ================= SEND MAIL =================
+
 app.post('/send', requireAuth, async (req, res) => {
   try {
     const { senderName, email, password, recipients, subject, message } = req.body;
 
-    if (!email || !password || !recipients || !message) {
-      return res.json({ success: false, message: "Missing fields" });
+    if (!email || !password || !recipients) {
+      return res.json({
+        success: false,
+        message: "Email, password and recipients required"
+      });
     }
 
-    // ❗ Allow ONLY ONE recipient
-    const list = recipients
+    const now = Date.now();
+
+    // ⏱️ Hourly sender reset
+    if (!mailLimits[email] || now - mailLimits[email].startTime > 60 * 60 * 1000) {
+      mailLimits[email] = { count: 0, startTime: now };
+    }
+
+    const recipientList = recipients
       .split(/[\n,]+/)
       .map(r => r.trim())
       .filter(Boolean);
 
-    if (list.length !== 1) {
+    if (mailLimits[email].count + recipientList.length > 27) {
       return res.json({
         success: false,
-        message: "Gmail safe mode: send to ONLY ONE recipient at a time"
-      });
-    }
-
-    const recipient = list[0];
-    const today = new Date().toDateString();
-    const now = Date.now();
-
-    if (!mailLimits[email] || mailLimits[email].day !== today) {
-      mailLimits[email] = { count: 0, day: today, lastSentAt: 0 };
-    }
-
-    // ❗ Daily hard limit = 2
-    if (mailLimits[email].count >= 2) {
-      return res.json({
-        success: false,
-        message: "Daily safe limit reached (2 emails/day per Gmail)"
-      });
-    }
-
-    // ❗ Enforce 30 minutes gap
-    if (now - mailLimits[email].lastSentAt < 30 * 60 * 1000) {
-      return res.json({
-        success: false,
-        message: "Please wait at least 30 minutes before next email"
+        message: `❌ Max 27 mails/hour | Remaining: ${27 - mailLimits[email].count}`
       });
     }
 
@@ -114,34 +166,31 @@ app.post('/send', requireAuth, async (req, res) => {
       auth: { user: email, pass: password }
     });
 
-    // Simple, personal-style footer
-    const footer = `\n\n—\n${senderName || "Regards"}`;
+    const mails = recipientList.map(r => ({
+      from: `"${senderName || 'Anonymous'}" <${email}>`,
+      to: r,
 
-    // Instant UI response
-    res.json({
+      // ✅ Re removed + inbox friendly subject
+      subject: subject || "Quick Note",
+
+      text: (message || "")
+    }));
+
+    await sendBatch(transporter, mails, 5);
+
+    mailLimits[email].count += recipientList.length;
+
+    return res.json({
       success: true,
-      message: "Email queued and sending now"
+      message: `✅ Sent ${recipientList.length} | Used ${mailLimits[email].count}/27`
     });
-
-    await transporter.sendMail({
-      from: `"${senderName || 'Me'}" <${email}>`,
-      to: recipient,
-      subject: subject || "Quick question",
-      text: `${message}${footer}`,
-      headers: {
-        "Reply-To": email
-      }
-    });
-
-    mailLimits[email].count += 1;
-    mailLimits[email].lastSentAt = Date.now();
 
   } catch (err) {
-    console.error(err);
+    return res.json({ success: false, message: err.message });
   }
 });
 
 // ================= START =================
 app.listen(PORT, () => {
-  console.log(`🚀 Gmail Safe Mailer running on port ${PORT}`);
+  console.log(`🚀 Mail Launcher running on port ${PORT}`);
 });
